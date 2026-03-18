@@ -20,3 +20,7 @@ data/outputs/*
 judge_compare.log
 run_pipeline.log
 run_pipeline_latest.log
+
+.gradio/
+frpc/
+experiment_records.jsonl

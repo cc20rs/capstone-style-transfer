@@ -1,0 +1,800 @@
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Tuple
+
+import gradio as gr
+import numpy as np
+import yaml
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+DATA_RAW_DIR = PROJECT_ROOT / "data" / "raw"
+EXPERIMENT_JSONL_PATH = PROJECT_ROOT / "experiment_records.jsonl"
+CONFIG_PATH = PROJECT_ROOT / "configs" / "config.yaml"
+
+
+@dataclass
+class PipelineResult:
+    generated_text: str
+    metrics: Dict[str, Any]
+
+
+class DataRepository:
+    SCENARIO_CONTEXT_TEMPLATES: Dict[str, Dict[str, List[str]]] = {
+        "luxun": {
+            "叙事": [
+                "他把雨伞收在门后，鞋底却带进来一地泥水，屋里的人都不作声。",
+                "钟声一下一下敲着，像把白日里没说完的话都钉在墙上。",
+            ],
+            "抒情": [
+                "风从窗纸缝里钻进来，像旧事的手，轻轻一碰就凉到心里。",
+                "夜色并不深，只是人心被雨声压得低了下去。",
+            ],
+            "讽刺": [
+                "人人都说公道，偏偏公道总要等散会后才肯露面。",
+                "他把漂亮话说得很圆，圆得正好滚开了责任。",
+            ],
+            "议论": [
+                "事情并不复杂，复杂的是人人都愿意把简单话说成雾。",
+                "所谓体面，不过是把难堪折叠起来，暂借灯光照着。",
+            ],
+        },
+        "qianzhongshu": {
+            "叙事": [
+                "他上楼时鞋声极轻，像怕惊动自己刚编好的理由。",
+                "茶凉得很快，像会议纪要里的热情。",
+            ],
+            "抒情": [
+                "黄昏像一封写了一半的信，落款总在天黑以后。",
+                "人的惆怅常常很文明，连叹息都懂得排队。",
+            ],
+            "讽刺": [
+                "他们把原则谈得如同瓷器，真正用时却当作一次性纸杯。",
+                "掌声总是很准时，结论却总在路上堵车。",
+            ],
+            "议论": [
+                "观点若没有代价，不过是语言对现实的客气。",
+                "聪明未必通向真理，倒常先通向自我原谅。",
+            ],
+        },
+        "biography": {
+            "叙事": [
+                "他在那一年做出决定，此后数十年的人生轨迹都由此改写。",
+                "一次看似寻常的经历，后来成为其思想转向的重要节点。",
+            ],
+            "抒情": [
+                "回望旧日，他把那些沉默时刻称作生命中最响亮的回声。",
+                "岁月在他的叙述里不再抽象，而是一页页可以触摸的纹理。",
+            ],
+            "讽刺": [
+                "外界常以头衔定义他，真正塑造他的却是那些无人喝彩的失败。",
+                "历史喜欢整齐的结论，而他的经历偏偏总从意外处生长。",
+            ],
+            "议论": [
+                "个体命运与时代结构并非平行线，它们总在关键处互相改写。",
+                "若只看结果，便会错过一生中最具解释力的过程。",
+            ],
+        },
+    }
+
+    def __init__(self) -> None:
+        self.test_cases = self._load_json(DATA_RAW_DIR / "test_cases.json").get("cases", [])
+        self.target_styles = self._load_json(DATA_RAW_DIR / "target_styles.json")
+        self.style_corpus = self._load_json(DATA_RAW_DIR / "style_corpus.json")
+        self.config = self._load_config(CONFIG_PATH)
+
+    @staticmethod
+    def _load_json(path: Path) -> Dict[str, Any]:
+        if not path.exists():
+            return {}
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    @staticmethod
+    def _load_config(path: Path) -> Dict[str, Any]:
+        if not path.exists():
+            return {}
+        return yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+
+    def mock_fetch_case_ids(self) -> List[str]:
+        # 按需求：这里先模拟只返回两个 case_id
+        return ["case_001", "case_002"]
+
+    def get_source_text_by_case_id(self, case_id: str) -> str:
+        for item in self.test_cases:
+            if item.get("case_id") == case_id:
+                return item.get("source_text", "")
+        return ""
+
+    def get_context_references(self, style_key: str) -> List[str]:
+        refs = self.target_styles.get(style_key, [])
+        return refs[:3]
+
+    def get_context_references_by_scenario(self, style_key: str, scenario: str) -> List[str]:
+        refs = self.SCENARIO_CONTEXT_TEMPLATES.get(style_key, {}).get(scenario, [])
+        if refs:
+            return refs[:3]
+        return self.get_context_references(style_key)
+
+    def get_rag_references(self, source_text: str, style_key: str) -> List[str]:
+        corpus = self.style_corpus.get(style_key, [])
+        if not corpus:
+            return []
+        top_k = self.config.get("rag", {}).get("top_k", 3)
+        vectorizer = TfidfVectorizer()
+        matrix = vectorizer.fit_transform([source_text] + corpus)
+        query = matrix[0:1]
+        docs = matrix[1:]
+        sims = cosine_similarity(query, docs).flatten()
+        top_indices = np.argsort(sims)[::-1][:top_k]
+        return [corpus[idx] for idx in top_indices.tolist()]
+
+
+class RealMainPipelineAdapter:
+    def __init__(self, project_root: Path, repo: DataRepository) -> None:
+        self.project_root = project_root
+        self.repo = repo
+        self._pipeline = None
+
+    @staticmethod
+    def _parse_references(style_references_text: str) -> List[str]:
+        text = (style_references_text or "").strip()
+        if not text:
+            return []
+        parts = [part.strip() for part in text.split("\n\n") if part.strip()]
+        if parts:
+            return parts
+        return [line.strip() for line in text.splitlines() if line.strip()]
+
+    @staticmethod
+    def _bind_prompt_to_style(system_prompt: str, target_style: str, scenario: str) -> str:
+        prompt = (system_prompt or "").strip()
+        if "{target_style}" in prompt or "{scenario}" in prompt:
+            return prompt.format(target_style=target_style, scenario=scenario)
+        return prompt
+
+    @staticmethod
+    def _build_generation_prompt(
+        source_text: str,
+        bound_system_prompt: str,
+        style_references: List[str],
+    ) -> str:
+        refs_text = "\n\n".join([f"参考片段{i + 1}: {item}" for i, item in enumerate(style_references)])
+        reference_block = (
+            f"以下是目标风格参考文本，请提炼其写作特征并迁移到改写中：\n{refs_text}\n\n"
+            if refs_text
+            else ""
+        )
+        return f"{bound_system_prompt}\n\n{reference_block}原文本：\n{source_text}\n"
+
+    def _get_pipeline(self):
+        if self._pipeline is None:
+            from main_pipeline import MainPipeline
+
+            self._pipeline = MainPipeline(self.project_root)
+        return self._pipeline
+
+    def run(
+        self,
+        source_text: str,
+        target_style_key: str,
+        target_style_label: str,
+        scenario: str,
+        method: str,
+        system_prompt: str,
+        style_references_text: str,
+    ) -> PipelineResult:
+        pipeline = self._get_pipeline()
+
+        refs_for_generation = [] if method == "Prompt_Eng" else self._parse_references(style_references_text)
+        bound_system_prompt = self._bind_prompt_to_style(
+            system_prompt=system_prompt,
+            target_style=target_style_label,
+            scenario=scenario,
+        )
+        final_prompt = self._build_generation_prompt(
+            source_text=source_text,
+            bound_system_prompt=bound_system_prompt,
+            style_references=refs_for_generation,
+        )
+
+        generated_text = pipeline.api_client.chat_completion(
+            model=pipeline.config["models"]["generation_model"],
+            prompt=final_prompt,
+            temperature=pipeline.config["generation"]["temperature"],
+            max_tokens=pipeline.config["generation"]["max_tokens"],
+        )
+
+        target_refs_for_eval = refs_for_generation or self.repo.get_context_references_by_scenario(
+            target_style_key,
+            scenario,
+        )
+        semantic = pipeline.semantic_metric.evaluate(source_text, generated_text, refs_for_generation)
+        judge_by_model = pipeline._evaluate_judge_models(generated_text, target_refs_for_eval)
+        primary_judge_model = pipeline.judge_models[0]
+        primary_judge = judge_by_model.get(primary_judge_model, {"score": 0.0, "details": {}})
+        style_vector = pipeline.style_vector_metric.evaluate(source_text, generated_text, target_refs_for_eval)
+        linguistic = pipeline.linguistic_metric.evaluate(
+            source_text,
+            generated_text,
+            target_refs_for_eval,
+            target_style_name=target_style_key,
+            target_scenario=scenario,
+        )
+        fluency = pipeline.fluency_metric.evaluate(source_text, generated_text, target_refs_for_eval)
+
+        metrics = {
+            "bert_score": float(semantic.get("score", 0.0)),
+            "llm_judge_score": float(primary_judge.get("score", 0.0)),
+            "style_vector_score": float(style_vector.get("score", 0.0)),
+            "linguistic_stats": linguistic.get("details", {}),
+            "fluency_score": float(fluency.get("score", 0.0)),
+            "details": {
+                "semantic": semantic.get("details", {}),
+                "llm_judge": primary_judge.get("details", {}),
+                "llm_judge_by_model": judge_by_model,
+                "style_vector": style_vector.get("details", {}),
+                "fluency": fluency.get("details", {}),
+            },
+        }
+
+        return PipelineResult(
+            generated_text=generated_text,
+            metrics=metrics,
+        )
+
+
+class ExperimentRecordStore:
+    def __init__(self, jsonl_path: Path) -> None:
+        self.jsonl_path = jsonl_path
+
+    def _read_records(self) -> List[Dict[str, Any]]:
+        if not self.jsonl_path.exists():
+            return []
+        rows: List[Dict[str, Any]] = []
+        for line in self.jsonl_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+        return rows
+
+    def _next_version(self, case_id: str, target_style: str, scenario: str, method: str) -> int:
+        records = self._read_records()
+        max_version = 0
+        for row in records:
+            if (
+                row.get("case_id") == case_id
+                and row.get("target_style") == target_style
+                and row.get("scenario") == scenario
+                and row.get("method") == method
+            ):
+                try:
+                    max_version = max(max_version, int(row.get("version", 0)))
+                except ValueError:
+                    pass
+        return max_version + 1
+
+    def save(
+        self,
+        case_id: str,
+        target_style: str,
+        scenario: str,
+        method: str,
+        source_text: str,
+        system_prompt: str,
+        style_references: List[str],
+        generated_text: str,
+        metrics: Dict[str, Any],
+    ) -> int:
+        version = self._next_version(
+            case_id=case_id,
+            target_style=target_style,
+            scenario=scenario,
+            method=method,
+        )
+
+        bert_score = float(metrics.get("bert_score", 0.0))
+        style_vector_score = float(metrics.get("style_vector_score", 0.0))
+        fluency_score = float(metrics.get("fluency_score", 0.0))
+
+        record = {
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "case_id": case_id,
+            "target_style": target_style,
+            "scenario": scenario,
+            "method": method,
+            "version": version,
+            "source_text": source_text,
+            "system_prompt": system_prompt,
+            "style_references": style_references,
+            "generated_text": generated_text,
+            "bert_score": bert_score,
+            "style_vector_score": style_vector_score,
+            "fluency_score": fluency_score,
+            "llm_judge_score": float(metrics.get("llm_judge_score", 0.0)),
+            "linguistic_stats": metrics.get("linguistic_stats", {}),
+            "details": metrics.get("details", {}),
+            "metrics": metrics,
+        }
+
+        with self.jsonl_path.open("a", encoding="utf-8") as file:
+            file.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+        return version
+
+
+class StyleTransferWebUI:
+    STYLE_OPTIONS = {
+        "鲁迅风": "luxun",
+        "钱钟书风": "qianzhongshu",
+        "知名传记风": "biography",
+    }
+
+    DEFAULT_SYSTEM_PROMPT = (
+        "你是一名叙事风格迁移助手。请将给定事实文本重写为“{target_style}-{scenario}”风格。\n"
+        "要求：\n"
+        "1) 保持事实内容与关键信息不变，避免幻觉。\n"
+        "2) 在词汇偏好、句式结构、情绪表达上体现目标风格。\n"
+        "3) 仅输出改写结果，不要解释。"
+    )
+
+    BEST_DEMO_PROMPT = (
+        "你是一名资深中文改写助手。请在保留事实的前提下，输出更自然、更连贯、"
+        "更有文学叙事感的改写文本，只输出改写结果。"
+    )
+
+    METHOD_OPTIONS = ["Prompt_Eng", "Context_Eng", "RAG_ICL"]
+    SCENARIO_OPTIONS = ["叙事", "抒情", "讽刺", "议论"]
+
+    DEMO_ROUTE_MATRIX: Dict[str, Dict[str, Dict[str, Any]]] = {
+        "鲁迅风": {
+            "叙事": {"method": "Context_Eng"},
+            "抒情": {"method": "RAG_ICL"},
+            "讽刺": {"method": "RAG_ICL"},
+            "议论": {"method": "Context_Eng"},
+        },
+        "钱钟书风": {
+            "叙事": {"method": "Context_Eng"},
+            "抒情": {"method": "Prompt_Eng"},
+            "讽刺": {"method": "RAG_ICL"},
+            "议论": {"method": "RAG_ICL"},
+        },
+        "知名传记风": {
+            "叙事": {"method": "Context_Eng"},
+            "抒情": {"method": "Prompt_Eng"},
+            "讽刺": {"method": "Prompt_Eng"},
+            "议论": {"method": "Context_Eng"},
+        },
+    }
+
+    PREVIEW_BOX_CSS = """
+    .route-preview textarea {
+        background: rgba(128, 128, 128, 0.12) !important;
+        border: 1px dashed rgba(120, 120, 120, 0.8) !important;
+        color: rgba(20, 20, 20, 0.88) !important;
+    }
+    .route-preview label {
+        opacity: 0.9;
+    }
+    """
+
+    def __init__(self) -> None:
+        self.repo = DataRepository()
+        self.store = ExperimentRecordStore(EXPERIMENT_JSONL_PATH)
+        self.pipeline_adapter = RealMainPipelineAdapter(PROJECT_ROOT, self.repo)
+
+    def _style_label_to_key(self, style_label: str) -> str:
+        return self.STYLE_OPTIONS.get(style_label, style_label)
+
+    @staticmethod
+    def _join_references(refs: List[str]) -> str:
+        return "\n\n".join(refs)
+
+    @staticmethod
+    def _parse_references_text(style_references_text: str) -> List[str]:
+        text = (style_references_text or "").strip()
+        if not text:
+            return []
+        parts = [part.strip() for part in text.split("\n\n") if part.strip()]
+        if parts:
+            return parts
+        return [line.strip() for line in text.splitlines() if line.strip()]
+
+    def _get_style_refs_update(self, method: str, style_label: str, scenario: str, source_text: str) -> gr.update:
+        style_key = self._style_label_to_key(style_label)
+        if method == "Prompt_Eng":
+            return gr.update(visible=False, value="")
+        if method == "Context_Eng":
+            refs = self.repo.get_context_references_by_scenario(style_key, scenario)
+            return gr.update(visible=True, value=self._join_references(refs))
+        refs = self.repo.get_rag_references(source_text=source_text, style_key=style_key)
+        return gr.update(visible=True, value=self._join_references(refs))
+
+    def _on_case_change(self, case_id: str, method: str, style_label: str, scenario: str) -> Tuple[str, gr.update]:
+        source_text = self.repo.get_source_text_by_case_id(case_id)
+        refs_update = self._get_style_refs_update(
+            method=method,
+            style_label=style_label,
+            scenario=scenario,
+            source_text=source_text,
+        )
+        return source_text, refs_update
+
+    def _on_method_or_style_change(self, method: str, style_label: str, scenario: str, source_text: str) -> gr.update:
+        return self._get_style_refs_update(
+            method=method,
+            style_label=style_label,
+            scenario=scenario,
+            source_text=source_text,
+        )
+
+    def _on_style_change_update_prompt_and_refs(
+        self,
+        method: str,
+        style_label: str,
+        scenario: str,
+        source_text: str,
+    ) -> Tuple[str, gr.update]:
+        # 关键：system_prompt 与 target_style 强绑定
+        prompt = self.DEFAULT_SYSTEM_PROMPT.format(target_style=style_label, scenario=scenario)
+        refs_update = self._get_style_refs_update(
+            method=method,
+            style_label=style_label,
+            scenario=scenario,
+            source_text=source_text,
+        )
+        return prompt, refs_update
+
+    def _on_scenario_change_update_prompt_and_refs(
+        self,
+        method: str,
+        target_style: str,
+        scenario: str,
+        source_text: str,
+    ) -> Tuple[str, gr.update]:
+        prompt = self.DEFAULT_SYSTEM_PROMPT.format(target_style=target_style, scenario=scenario)
+        refs_update = self._get_style_refs_update(
+            method=method,
+            style_label=target_style,
+            scenario=scenario,
+            source_text=source_text,
+        )
+        return prompt, refs_update
+
+    def _scenario_few_shot_templates(self, target_style: str, scenario: str) -> List[str]:
+        style_key = self._style_label_to_key(target_style)
+        return self.repo.get_context_references_by_scenario(style_key, scenario)
+
+    def _resolve_demo_route(self, target_style: str, scenario: str, source_text: str) -> Dict[str, Any]:
+        style_routes = self.DEMO_ROUTE_MATRIX.get(target_style, {})
+        route = style_routes.get(scenario)
+        if route is None:
+            route = {"method": "Prompt_Eng"}
+
+        method = route.get("method", "Prompt_Eng")
+        demo_prompt = (
+            "你是一名长文本风格迁移助手。请将给定事实文本改写为“{target_style}-{scenario}”风格，"
+            "保持事实不变、语言自然、有可读性，只输出改写结果。"
+        )
+
+        few_shot_list = []
+        if method == "Context_Eng":
+            # Context_Eng：使用写死的最优模板
+            few_shot_list = self._scenario_few_shot_templates(target_style=target_style, scenario=scenario)
+            if not few_shot_list:
+                few_shot_list = self.repo.get_context_references(self._style_label_to_key(target_style))
+        elif method == "RAG_ICL":
+            # RAG_ICL：根据输入文本实时进行知识库匹配更新
+            few_shot_list = self.repo.get_rag_references(source_text, self._style_label_to_key(target_style))
+
+        reason = f"经过迭代测试，{target_style}的{scenario}场景使用{method}策略效果最好。"
+
+        return {
+            "method": method,
+            "system_prompt": demo_prompt,
+            "few_shot_list": few_shot_list,
+            "reason": reason,
+        }
+
+    def _run_experiment(
+        self,
+        case_id: str,
+        source_text: str,
+        target_style: str,
+        scenario: str,
+        method: str,
+        system_prompt: str,
+        style_references: str,
+    ) -> Tuple[str, Dict[str, Any]]:
+        style_key = self._style_label_to_key(target_style)
+        effective_refs = "" if method == "Prompt_Eng" else (style_references or "")
+
+        final_system_prompt = (system_prompt or self.DEFAULT_SYSTEM_PROMPT).strip()
+        try:
+            result = self.pipeline_adapter.run(
+                source_text=source_text,
+                target_style_key=style_key,
+                target_style_label=target_style,
+                scenario=scenario,
+                method=method,
+                system_prompt=final_system_prompt,
+                style_references_text=effective_refs,
+            )
+        except Exception as exc:
+            gr.Warning(f"运行失败：{exc}")
+            return "", {"error": str(exc)}
+
+        metrics = dict(result.metrics)
+        metrics["target_style"] = style_key
+        metrics["scenario"] = scenario
+        metrics["method"] = method
+        metrics["case_id"] = case_id
+        return result.generated_text, metrics
+
+    def _save_record(
+        self,
+        case_id: str,
+        source_text: str,
+        target_style: str,
+        scenario: str,
+        method: str,
+        system_prompt: str,
+        style_references: str,
+        generated_text: str,
+        metrics: Dict[str, Any],
+    ) -> str:
+        if not generated_text.strip():
+            gr.Warning("请先点击“运行生成与评估”，再执行保存。")
+            return "保存失败：请先运行。"
+
+        if not isinstance(metrics, dict):
+            gr.Warning("指标结果为空或格式异常，请重新运行。")
+            return "保存失败：metrics 异常。"
+
+        if "error" in metrics:
+            gr.Warning("当前结果包含错误信息，请先修复后再保存。")
+            return "保存失败：运行报错。"
+
+        effective_refs = "" if method == "Prompt_Eng" else (style_references or "")
+        refs_list = [] if method == "Prompt_Eng" else self._parse_references_text(effective_refs)
+        version = self.store.save(
+            case_id=case_id,
+            target_style=self._style_label_to_key(target_style),
+            scenario=scenario,
+            method=method,
+            source_text=source_text,
+            system_prompt=system_prompt,
+            style_references=refs_list,
+            generated_text=generated_text,
+            metrics=metrics,
+        )
+        gr.Info(f"保存成功，当前 Version = {version}")
+        return f"保存成功：case_id={case_id}, target_style={target_style}, scenario={scenario}, method={method}, version={version}"
+
+    def _demo_generate(self, source_text: str, target_style: str, scenario: str) -> str:
+        style_key = self._style_label_to_key(target_style)
+        route = self._resolve_demo_route(target_style=target_style, scenario=scenario, source_text=source_text)
+        few_shot_text = self._join_references(route["few_shot_list"])
+        try:
+            result = self.pipeline_adapter.run(
+                source_text=source_text,
+                target_style_key=style_key,
+                target_style_label=target_style,
+                scenario=scenario,
+                method=route["method"],
+                system_prompt=route["system_prompt"],
+                style_references_text=few_shot_text,
+            )
+            return result.generated_text
+        except Exception as exc:
+            gr.Warning(f"生成失败：{exc}")
+            return ""
+
+    def _preview_demo_route(self, source_text: str, target_style: str, scenario: str) -> Tuple[str, str, str]:
+        route = self._resolve_demo_route(target_style=target_style, scenario=scenario, source_text=source_text)
+        method = route.get("method", "Prompt_Eng")
+        few_shot_list = route.get("few_shot_list", [])
+        few_shot_text = self._join_references(few_shot_list)
+        if not few_shot_text.strip():
+            few_shot_text = "（无，当前自动策略不使用 few-shot）"
+        reason = route.get("reason", "")
+        return method, few_shot_text, reason
+
+    def build(self) -> gr.Blocks:
+        case_id_choices = self.repo.mock_fetch_case_ids()
+        default_case_id = case_id_choices[0] if case_id_choices else "case_001"
+        default_source = self.repo.get_source_text_by_case_id(default_case_id)
+        style_labels = list(self.STYLE_OPTIONS.keys())
+        default_style = style_labels[0]
+        default_scenario = self.SCENARIO_OPTIONS[0]
+        default_method = self.METHOD_OPTIONS[0]
+
+        with gr.Blocks() as demo:
+            gr.Markdown("# 长文本风格迁移 Web UI（实验版）")
+
+            with gr.Tab("实验调试区"):
+                with gr.Row():
+                    with gr.Column(scale=5):
+                        case_id = gr.Dropdown(
+                            label="case_id",
+                            choices=case_id_choices,
+                            value=default_case_id,
+                            interactive=True,
+                        )
+                        source_text = gr.Textbox(
+                            label="source_text",
+                            lines=8,
+                            value=default_source,
+                            interactive=True,
+                        )
+                        target_style = gr.Dropdown(
+                            label="target_style",
+                            choices=style_labels,
+                            value=default_style,
+                            interactive=True,
+                        )
+                        scenario = gr.Dropdown(
+                            label="scenario",
+                            choices=self.SCENARIO_OPTIONS,
+                            value=default_scenario,
+                            interactive=True,
+                        )
+                        method = gr.Radio(
+                            label="method",
+                            choices=self.METHOD_OPTIONS,
+                            value=default_method,
+                            interactive=True,
+                        )
+                        system_prompt = gr.Textbox(
+                            label="system_prompt",
+                            lines=8,
+                            value=self.DEFAULT_SYSTEM_PROMPT.format(target_style=default_style, scenario=default_scenario),
+                            interactive=True,
+                        )
+                        style_references = gr.Textbox(
+                            label="style_references",
+                            lines=8,
+                            value="",
+                            visible=False,
+                            interactive=True,
+                        )
+                        run_btn = gr.Button("🚀 运行生成与评估", variant="primary")
+
+                gr.Markdown("---")
+                with gr.Row():
+                    with gr.Column(scale=6):
+                        generated_text = gr.Textbox(label="generated_text", lines=12, interactive=False)
+                    with gr.Column(scale=4):
+                        metrics_json = gr.JSON(label="metrics（对齐 case_summary）")
+                        save_btn = gr.Button("保存当前策略与结果落盘")
+                        save_status = gr.Textbox(label="保存状态", interactive=False)
+
+                # 关键事件绑定1：切换 case_id 时，自动联动 source_text 与 style_references
+                case_id.change(
+                    fn=self._on_case_change,
+                    inputs=[case_id, method, target_style, scenario],
+                    outputs=[source_text, style_references],
+                )
+
+                # 关键事件绑定2：method 变化时，动态控制 style_references 显示与自动填充
+                method.change(
+                    fn=self._on_method_or_style_change,
+                    inputs=[method, target_style, scenario, source_text],
+                    outputs=[style_references],
+                )
+
+                # 关键事件绑定3：target_style 变化时，联动刷新 system_prompt 与 style_references
+                target_style.change(
+                    fn=self._on_style_change_update_prompt_and_refs,
+                    inputs=[method, target_style, scenario, source_text],
+                    outputs=[system_prompt, style_references],
+                )
+
+                # 关键事件绑定4：scenario 变化时，刷新 system_prompt
+                scenario.change(
+                    fn=self._on_scenario_change_update_prompt_and_refs,
+                    inputs=[method, target_style, scenario, source_text],
+                    outputs=[system_prompt, style_references],
+                )
+
+                run_btn.click(
+                    fn=self._run_experiment,
+                    inputs=[case_id, source_text, target_style, scenario, method, system_prompt, style_references],
+                    outputs=[generated_text, metrics_json],
+                )
+
+                save_btn.click(
+                    fn=self._save_record,
+                    inputs=[
+                        case_id,
+                        source_text,
+                        target_style,
+                        scenario,
+                        method,
+                        system_prompt,
+                        style_references,
+                        generated_text,
+                        metrics_json,
+                    ],
+                    outputs=[save_status],
+                )
+
+            with gr.Tab("演示区"):
+                demo_source = gr.Textbox(label="source_text", lines=10)
+                demo_style = gr.Dropdown(label="target_style", choices=style_labels, value=default_style)
+                demo_scenario = gr.Dropdown(label="scenario", choices=self.SCENARIO_OPTIONS, value=default_scenario)
+                demo_auto_method = gr.Textbox(
+                    label="自动选择策略（路由结果）",
+                    interactive=False,
+                    elem_classes=["route-preview"],
+                )
+                demo_auto_few_shot = gr.Textbox(
+                    label="自动选择 few-shot 模板（路由结果）",
+                    lines=6,
+                    interactive=False,
+                    elem_classes=["route-preview"],
+                )
+                demo_auto_reason = gr.Textbox(
+                    label="自动选择原因（路由说明）",
+                    lines=2,
+                    interactive=False,
+                    elem_classes=["route-preview"],
+                )
+                demo_btn = gr.Button("一键生成", variant="primary")
+                demo_output = gr.Textbox(label="generated_text", lines=12, interactive=False)
+
+                demo_source.change(
+                    fn=self._preview_demo_route,
+                    inputs=[demo_source, demo_style, demo_scenario],
+                    outputs=[demo_auto_method, demo_auto_few_shot, demo_auto_reason],
+                )
+                demo_style.change(
+                    fn=self._preview_demo_route,
+                    inputs=[demo_source, demo_style, demo_scenario],
+                    outputs=[demo_auto_method, demo_auto_few_shot, demo_auto_reason],
+                )
+                demo_scenario.change(
+                    fn=self._preview_demo_route,
+                    inputs=[demo_source, demo_style, demo_scenario],
+                    outputs=[demo_auto_method, demo_auto_few_shot, demo_auto_reason],
+                )
+
+                demo.load(
+                    fn=self._preview_demo_route,
+                    inputs=[demo_source, demo_style, demo_scenario],
+                    outputs=[demo_auto_method, demo_auto_few_shot, demo_auto_reason],
+                )
+
+                demo_btn.click(
+                    fn=self._demo_generate,
+                    inputs=[demo_source, demo_style, demo_scenario],
+                    outputs=[demo_output],
+                )
+
+        return demo
+
+
+def main() -> None:
+    ui = StyleTransferWebUI()
+    app = ui.build()
+    app.launch(
+        server_name="0.0.0.0",
+        server_port=7860,
+        share=True,
+        auth=("capstone", "cuhksz"),
+        theme=gr.themes.Soft(),
+        css=StyleTransferWebUI.PREVIEW_BOX_CSS,
+    )
+
+
+if __name__ == "__main__":
+    main()
