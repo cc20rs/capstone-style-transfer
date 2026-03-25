@@ -33,6 +33,7 @@ class DataRepository:
         self.style_corpus = self._load_json(DATA_RAW_DIR / "style_corpus.json")
         self.context_eng_style_references = self._load_json(CONTEXT_ENG_STYLE_REFERENCES_PATH)
         self.config = self._load_config(CONFIG_PATH)
+        self._rag_index_cache: Dict[str, Tuple[TfidfVectorizer, Any, List[str]]] = {}
 
     @staticmethod
     def _load_json(path: Path) -> Dict[str, Any]:
@@ -47,8 +48,19 @@ class DataRepository:
         return yaml.safe_load(path.read_text(encoding="utf-8")) or {}
 
     def mock_fetch_case_ids(self) -> List[str]:
-        # 按需求：这里先模拟只返回两个 case_id
-        return ["case_001", "case_002"]
+        case_ids: List[str] = []
+        for item in self.test_cases:
+            case_id = item.get("case_id")
+            if isinstance(case_id, str) and case_id.strip():
+                case_ids.append(case_id.strip())
+        seen = set()
+        unique_case_ids: List[str] = []
+        for case_id in case_ids:
+            if case_id in seen:
+                continue
+            seen.add(case_id)
+            unique_case_ids.append(case_id)
+        return unique_case_ids
 
     def get_source_text_by_case_id(self, case_id: str) -> str:
         for item in self.test_cases:
@@ -57,25 +69,70 @@ class DataRepository:
         return ""
 
     def get_context_references(self, style_key: str) -> List[str]:
-        refs = self.target_styles.get(style_key, [])
+        refs = self._normalize_text_list(self.target_styles.get(style_key, []))
         return refs[:3]
 
     def get_context_references_by_scenario(self, style_key: str, scenario: str) -> List[str]:
-        refs = self.context_eng_style_references.get(style_key, {}).get(scenario, [])
+        scenario_block = self.context_eng_style_references.get(style_key, {})
+        refs = self._normalize_text_list(scenario_block.get(scenario, []) if isinstance(scenario_block, dict) else [])
         if refs:
             return refs[:3]
         return self.get_context_references(style_key)
 
-    def get_rag_references(self, source_text: str, style_key: str) -> List[str]:
-        corpus = self.style_corpus.get(style_key, [])
+    @staticmethod
+    def _normalize_text_list(value: Any) -> List[str]:
+        if isinstance(value, list):
+            return [item.strip() for item in value if isinstance(item, str) and item.strip()]
+        if isinstance(value, str):
+            return [value.strip()] if value.strip() else []
+        if isinstance(value, dict):
+            merged: List[str] = []
+            for nested in value.values():
+                if isinstance(nested, list):
+                    merged.extend([item.strip() for item in nested if isinstance(item, str) and item.strip()])
+                elif isinstance(nested, str) and nested.strip():
+                    merged.append(nested.strip())
+            return merged
+        return []
+
+    def _build_rag_index(self, style_key: str) -> Tuple[TfidfVectorizer, Any, List[str]] | None:
+        if style_key in self._rag_index_cache:
+            return self._rag_index_cache[style_key]
+
+        corpus = self._normalize_text_list(self.style_corpus.get(style_key, []))
         if not corpus:
-            return []
-        top_k = self.config.get("rag", {}).get("top_k", 3)
+            return None
+
         vectorizer = TfidfVectorizer()
-        matrix = vectorizer.fit_transform([source_text] + corpus)
-        query = matrix[0:1]
-        docs = matrix[1:]
-        sims = cosine_similarity(query, docs).flatten()
+        try:
+            docs_matrix = vectorizer.fit_transform(corpus)
+        except ValueError:
+            return None
+
+        bundle = (vectorizer, docs_matrix, corpus)
+        self._rag_index_cache[style_key] = bundle
+        return bundle
+
+    def get_rag_references(self, source_text: str, style_key: str) -> List[str]:
+        source = (source_text or "").strip()
+        index_bundle = self._build_rag_index(style_key)
+        if index_bundle is None:
+            return []
+
+        vectorizer, docs_matrix, corpus = index_bundle
+
+        top_k = int(self.config.get("rag", {}).get("top_k", 3))
+        top_k = max(1, min(top_k, len(corpus)))
+
+        if not source:
+            return corpus[:top_k]
+
+        try:
+            query = vectorizer.transform([source])
+        except ValueError:
+            return corpus[:top_k]
+
+        sims = cosine_similarity(query, docs_matrix).flatten()
         top_indices = np.argsort(sims)[::-1][:top_k]
         return [corpus[idx] for idx in top_indices.tolist()]
 
@@ -278,14 +335,10 @@ class ExperimentRecordStore:
 
 
 class StyleTransferWebUI:
-    STYLE_OPTIONS = {
-        "鲁迅风": "luxun",
-        "钱钟书风": "qianzhongshu",
-        "知名传记风": "biography",
-    }
+    STYLE_OPTIONS: Dict[str, str] = {}
 
     DEFAULT_SYSTEM_PROMPT = (
-        "你是一名叙事风格迁移助手。请将给定事实文本重写为“{target_style}-{scenario}”风格。\n"
+        "你是一名叙事风格迁移助手。请将给定事实文本重写为“{target_style}”风格。\n"
         "要求：\n"
         "1) 保持事实内容与关键信息不变，避免幻觉。\n"
         "2) 在词汇偏好、句式结构、情绪表达上体现目标风格。\n"
@@ -336,13 +389,33 @@ class StyleTransferWebUI:
         self.repo = DataRepository()
         self.store = ExperimentRecordStore(EXPERIMENT_JSONL_PATH)
         self.pipeline_adapter = RealMainPipelineAdapter(PROJECT_ROOT, self.repo)
+        context_styles = list(self.repo.context_eng_style_references.keys())
+        if context_styles:
+            self.style_labels = context_styles
+        elif self.repo.target_styles:
+            self.style_labels = list(self.repo.target_styles.keys())
+        else:
+            self.style_labels = ["luxun"]
+        self.style_options = {label: label for label in self.style_labels}
 
     def _style_label_to_key(self, style_label: str) -> str:
-        return self.STYLE_OPTIONS.get(style_label, style_label)
+        return self.style_options.get(style_label, style_label)
 
     @staticmethod
-    def _join_references(refs: List[str]) -> str:
-        return "\n\n".join(refs)
+    def _join_references(refs: Any) -> str:
+        if isinstance(refs, str):
+            return refs
+        if isinstance(refs, list):
+            return "\n\n".join([item for item in refs if isinstance(item, str)])
+        if isinstance(refs, dict):
+            merged: List[str] = []
+            for value in refs.values():
+                if isinstance(value, list):
+                    merged.extend([item for item in value if isinstance(item, str)])
+                elif isinstance(value, str):
+                    merged.append(value)
+            return "\n\n".join(merged)
+        return ""
 
     @staticmethod
     def _parse_references_text(style_references_text: str) -> List[str]:
@@ -356,13 +429,16 @@ class StyleTransferWebUI:
 
     def _get_style_refs_update(self, method: str, style_label: str, scenario: str, source_text: str) -> gr.update:
         style_key = self._style_label_to_key(style_label)
-        if method == "Prompt_Eng":
-            return gr.update(visible=False, value="")
-        if method == "Context_Eng":
-            refs = self.repo.get_context_references_by_scenario(style_key, scenario)
+        try:
+            if method == "Prompt_Eng":
+                return gr.update(visible=False, value="")
+            if method == "Context_Eng":
+                refs = self.repo.get_context_references_by_scenario(style_key, scenario)
+                return gr.update(visible=True, value=self._join_references(refs))
+            refs = self.repo.get_rag_references(source_text=source_text, style_key=style_key)
             return gr.update(visible=True, value=self._join_references(refs))
-        refs = self.repo.get_rag_references(source_text=source_text, style_key=style_key)
-        return gr.update(visible=True, value=self._join_references(refs))
+        except Exception:
+            return gr.update(visible=True, value="")
 
     def _on_case_change(self, case_id: str, method: str, style_label: str, scenario: str) -> Tuple[str, gr.update]:
         source_text = self.repo.get_source_text_by_case_id(case_id)
@@ -561,7 +637,7 @@ class StyleTransferWebUI:
         case_id_choices = self.repo.mock_fetch_case_ids()
         default_case_id = case_id_choices[0] if case_id_choices else "case_001"
         default_source = self.repo.get_source_text_by_case_id(default_case_id)
-        style_labels = list(self.STYLE_OPTIONS.keys())
+        style_labels = list(self.style_labels)
         default_style = style_labels[0]
         default_scenario = self.SCENARIO_OPTIONS[0]
         default_method = self.METHOD_OPTIONS[0]
@@ -594,6 +670,7 @@ class StyleTransferWebUI:
                             label="scenario",
                             choices=self.SCENARIO_OPTIONS,
                             value=default_scenario,
+                            visible=False,
                             interactive=True,
                         )
                         method = gr.Radio(
@@ -633,6 +710,7 @@ class StyleTransferWebUI:
                     fn=self._on_case_change,
                     inputs=[case_id, method, target_style, scenario],
                     outputs=[source_text, style_references],
+                    queue=False,
                 )
 
                 # 关键事件绑定2：method 变化时，动态控制 style_references 显示与自动填充
@@ -640,6 +718,7 @@ class StyleTransferWebUI:
                     fn=self._on_method_or_style_change,
                     inputs=[method, target_style, scenario, source_text],
                     outputs=[style_references],
+                    queue=False,
                 )
 
                 # 关键事件绑定3：target_style 变化时，联动刷新 system_prompt 与 style_references
@@ -647,6 +726,7 @@ class StyleTransferWebUI:
                     fn=self._on_style_change_update_prompt_and_refs,
                     inputs=[method, target_style, scenario, source_text],
                     outputs=[system_prompt, style_references],
+                    queue=False,
                 )
 
                 # 关键事件绑定4：scenario 变化时，刷新 system_prompt
@@ -654,6 +734,7 @@ class StyleTransferWebUI:
                     fn=self._on_scenario_change_update_prompt_and_refs,
                     inputs=[method, target_style, scenario, source_text],
                     outputs=[system_prompt, style_references],
+                    queue=False,
                 )
 
                 run_btn.click(
@@ -683,7 +764,7 @@ class StyleTransferWebUI:
             with gr.Tab("演示区"):
                 demo_source = gr.Textbox(label="source_text", lines=10)
                 demo_style = gr.Dropdown(label="target_style", choices=style_labels, value=default_style)
-                demo_scenario = gr.Dropdown(label="scenario", choices=self.SCENARIO_OPTIONS, value=default_scenario)
+                demo_scenario = gr.Dropdown(label="scenario", choices=self.SCENARIO_OPTIONS, value=default_scenario, visible=False)
                 demo_auto_method = gr.Textbox(
                     label="自动选择策略（路由结果）",
                     interactive=False,
@@ -708,22 +789,26 @@ class StyleTransferWebUI:
                     fn=self._preview_demo_route,
                     inputs=[demo_source, demo_style, demo_scenario],
                     outputs=[demo_auto_method, demo_auto_few_shot, demo_auto_reason],
+                    queue=False,
                 )
                 demo_style.change(
                     fn=self._preview_demo_route,
                     inputs=[demo_source, demo_style, demo_scenario],
                     outputs=[demo_auto_method, demo_auto_few_shot, demo_auto_reason],
+                    queue=False,
                 )
                 demo_scenario.change(
                     fn=self._preview_demo_route,
                     inputs=[demo_source, demo_style, demo_scenario],
                     outputs=[demo_auto_method, demo_auto_few_shot, demo_auto_reason],
+                    queue=False,
                 )
 
                 demo.load(
                     fn=self._preview_demo_route,
                     inputs=[demo_source, demo_style, demo_scenario],
                     outputs=[demo_auto_method, demo_auto_few_shot, demo_auto_reason],
+                    queue=False,
                 )
 
                 demo_btn.click(
