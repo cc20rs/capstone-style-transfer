@@ -75,9 +75,7 @@ class DataRepository:
     def get_context_references_by_scenario(self, style_key: str, scenario: str) -> List[str]:
         scenario_block = self.context_eng_style_references.get(style_key, {})
         refs = self._normalize_text_list(scenario_block.get(scenario, []) if isinstance(scenario_block, dict) else [])
-        if refs:
-            return refs[:3]
-        return self.get_context_references(style_key)
+        return refs[:3]
 
     @staticmethod
     def _normalize_text_list(value: Any) -> List[str]:
@@ -212,23 +210,22 @@ class RealMainPipelineAdapter:
             max_tokens=pipeline.config["generation"]["max_tokens"],
         )
 
-        target_refs_for_eval = refs_for_generation or self.repo.get_context_references_by_scenario(
-            target_style_key,
-            scenario,
-        )
+        if method == "Prompt_Eng":
+            eval_refs: List[str] = []
+        else:
+            eval_refs = refs_for_generation
+
         semantic = pipeline.semantic_metric.evaluate(source_text, generated_text, refs_for_generation)
-        judge_by_model = pipeline._evaluate_judge_models(generated_text, target_refs_for_eval)
-        primary_judge_model = pipeline.judge_models[0]
-        primary_judge = judge_by_model.get(primary_judge_model, {"score": 0.0, "details": {}})
-        style_vector = pipeline.style_vector_metric.evaluate(source_text, generated_text, target_refs_for_eval)
+        primary_judge = pipeline._evaluate_single_judge(generated_text, eval_refs)
+        style_vector = pipeline.style_vector_metric.evaluate(source_text, generated_text, eval_refs)
         linguistic = pipeline.linguistic_metric.evaluate(
             source_text,
             generated_text,
-            target_refs_for_eval,
+            eval_refs,
             target_style_name=target_style_key,
             target_scenario=scenario,
         )
-        fluency = pipeline.fluency_metric.evaluate(source_text, generated_text, target_refs_for_eval)
+        fluency = pipeline.fluency_metric.evaluate(source_text, generated_text, eval_refs)
 
         metrics = {
             "bert_score": float(semantic.get("score", 0.0)),
@@ -239,7 +236,6 @@ class RealMainPipelineAdapter:
             "details": {
                 "semantic": semantic.get("details", {}),
                 "llm_judge": primary_judge.get("details", {}),
-                "llm_judge_by_model": judge_by_model,
                 "style_vector": style_vector.get("details", {}),
                 "fluency": fluency.get("details", {}),
             },
@@ -431,16 +427,16 @@ class StyleTransferWebUI:
         style_key = self._style_label_to_key(style_label)
         try:
             if method == "Prompt_Eng":
-                return gr.update(visible=False, value="")
+                return gr.update(visible=False, value=""), False
             if method == "Context_Eng":
                 refs = self.repo.get_context_references_by_scenario(style_key, scenario)
-                return gr.update(visible=True, value=self._join_references(refs))
+                return gr.update(visible=True, value=self._join_references(refs)), False
             refs = self.repo.get_rag_references(source_text=source_text, style_key=style_key)
-            return gr.update(visible=True, value=self._join_references(refs))
+            return gr.update(visible=True, value=self._join_references(refs)), False
         except Exception:
-            return gr.update(visible=True, value="")
+            return gr.update(visible=True, value=""), False
 
-    def _on_case_change(self, case_id: str, method: str, style_label: str, scenario: str) -> Tuple[str, gr.update]:
+    def _on_case_change(self, case_id: str, method: str, style_label: str, scenario: str) -> Tuple[str, gr.update, bool]:
         source_text = self.repo.get_source_text_by_case_id(case_id)
         refs_update = self._get_style_refs_update(
             method=method,
@@ -448,15 +444,23 @@ class StyleTransferWebUI:
             scenario=scenario,
             source_text=source_text,
         )
-        return source_text, refs_update
+        # _get_style_refs_update now returns (gr.update, loading_flag)
+        if isinstance(refs_update, tuple):
+            refs, loading = refs_update
+        else:
+            refs, loading = refs_update, False
+        return source_text, refs, loading
 
-    def _on_method_or_style_change(self, method: str, style_label: str, scenario: str, source_text: str) -> gr.update:
-        return self._get_style_refs_update(
+    def _on_method_or_style_change(self, method: str, style_label: str, scenario: str, source_text: str) -> Tuple[gr.update, bool]:
+        refs_update = self._get_style_refs_update(
             method=method,
             style_label=style_label,
             scenario=scenario,
             source_text=source_text,
         )
+        if isinstance(refs_update, tuple):
+            return refs_update
+        return refs_update, False
 
     def _on_style_change_update_prompt_and_refs(
         self,
@@ -464,7 +468,7 @@ class StyleTransferWebUI:
         style_label: str,
         scenario: str,
         source_text: str,
-    ) -> Tuple[str, gr.update]:
+    ) -> Tuple[str, gr.update, bool]:
         # 关键：system_prompt 与 target_style 强绑定
         prompt = self.DEFAULT_SYSTEM_PROMPT.format(target_style=style_label, scenario=scenario)
         refs_update = self._get_style_refs_update(
@@ -473,7 +477,11 @@ class StyleTransferWebUI:
             scenario=scenario,
             source_text=source_text,
         )
-        return prompt, refs_update
+        if isinstance(refs_update, tuple):
+            refs, loading = refs_update
+        else:
+            refs, loading = refs_update, False
+        return prompt, refs, loading
 
     def _on_scenario_change_update_prompt_and_refs(
         self,
@@ -481,7 +489,7 @@ class StyleTransferWebUI:
         target_style: str,
         scenario: str,
         source_text: str,
-    ) -> Tuple[str, gr.update]:
+    ) -> Tuple[str, gr.update, bool]:
         prompt = self.DEFAULT_SYSTEM_PROMPT.format(target_style=target_style, scenario=scenario)
         refs_update = self._get_style_refs_update(
             method=method,
@@ -489,7 +497,11 @@ class StyleTransferWebUI:
             scenario=scenario,
             source_text=source_text,
         )
-        return prompt, refs_update
+        if isinstance(refs_update, tuple):
+            refs, loading = refs_update
+        else:
+            refs, loading = refs_update, False
+        return prompt, refs, loading
 
     def _scenario_few_shot_templates(self, target_style: str, scenario: str) -> List[str]:
         style_key = self._style_label_to_key(target_style)
@@ -704,12 +716,13 @@ class StyleTransferWebUI:
                         save_status = gr.Textbox(label="保存状态", interactive=False)
                 last_runtime_system_prompt = gr.State(value="")
                 last_runtime_style_references = gr.State(value="")
+                style_refs_loading = gr.State(value=False)
 
                 # 关键事件绑定1：切换 case_id 时，自动联动 source_text 与 style_references
                 case_id.change(
                     fn=self._on_case_change,
                     inputs=[case_id, method, target_style, scenario],
-                    outputs=[source_text, style_references],
+                    outputs=[source_text, style_references, style_refs_loading],
                     queue=False,
                 )
 
@@ -717,7 +730,7 @@ class StyleTransferWebUI:
                 method.change(
                     fn=self._on_method_or_style_change,
                     inputs=[method, target_style, scenario, source_text],
-                    outputs=[style_references],
+                    outputs=[style_references, style_refs_loading],
                     queue=False,
                 )
 
@@ -725,7 +738,7 @@ class StyleTransferWebUI:
                 target_style.change(
                     fn=self._on_style_change_update_prompt_and_refs,
                     inputs=[method, target_style, scenario, source_text],
-                    outputs=[system_prompt, style_references],
+                    outputs=[system_prompt, style_references, style_refs_loading],
                     queue=False,
                 )
 
@@ -733,7 +746,7 @@ class StyleTransferWebUI:
                 scenario.change(
                     fn=self._on_scenario_change_update_prompt_and_refs,
                     inputs=[method, target_style, scenario, source_text],
-                    outputs=[system_prompt, style_references],
+                    outputs=[system_prompt, style_references, style_refs_loading],
                     queue=False,
                 )
 
