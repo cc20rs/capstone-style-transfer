@@ -107,17 +107,15 @@ def _build_summary_md(records: List[Dict[str, Any]]) -> str:
         "",
         "## 二、表格二（仅大模型裁判评分对比，最右侧为评语）",
         "",
-        "| 样本ID(case_id) | 策略(strategy) | 目标风格(style_name) | DeepSeek-V3.2-词汇 | DeepSeek-V3.2-句法 | DeepSeek-V3.2-情绪 | DeepSeek-V3.2-总分 | Qwen3-Next-80B-A3B-Instruct-词汇 | Qwen3-Next-80B-A3B-Instruct-句法 | Qwen3-Next-80B-A3B-Instruct-情绪 | Qwen3-Next-80B-A3B-Instruct-总分 | DeepSeek-V3.2-评语 | Qwen3-Next-80B-A3B-Instruct-评语 |",
-        "|---|---|---|---|---|---|---|---|---|---|---|---|---|",
+        "| 样本ID(case_id) | 策略(strategy) | 目标风格(style_name) | DeepSeek-V3.2-词汇 | DeepSeek-V3.2-句法 | DeepSeek-V3.2-情绪 | DeepSeek-V3.2-总分 | DeepSeek-V3.2-评语 |",
+        "|---|---|---|---|---|---|---|---|",
     ]
     section2_rows = []
     for rec in records:
         method = rec.get("method", "")
         strategy = STRATEGY_MAP.get(method, method)
         details = rec.get("details", {})
-        judge_all = details.get("llm_judge_by_model", {})
-        deepseek = judge_all.get("DeepSeek-V3.2", {}).get("details", {})
-        qwen = judge_all.get("Qwen3-Next-80B-A3B-Instruct", {}).get("details", {})
+        deepseek = details.get("llm_judge", {}) if isinstance(details.get("llm_judge", {}), dict) else {}
         section2_rows.append(
             "| "
             + " | ".join(
@@ -129,12 +127,7 @@ def _build_summary_md(records: List[Dict[str, Any]]) -> str:
                     _fmt(float(deepseek.get("syntax", 0.0))),
                     _fmt(float(deepseek.get("emotion", 0.0))),
                     _fmt(float(deepseek.get("overall", 0.0))),
-                    _fmt(float(qwen.get("lexical", 0.0))),
-                    _fmt(float(qwen.get("syntax", 0.0))),
-                    _fmt(float(qwen.get("emotion", 0.0))),
-                    _fmt(float(qwen.get("overall", 0.0))),
                     str(deepseek.get("comment", "")).replace("\n", " "),
-                    str(qwen.get("comment", "")).replace("\n", " "),
                 ]
             )
             + " |"

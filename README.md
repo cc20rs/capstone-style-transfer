@@ -1,3 +1,9 @@
+---
+title: style-transfer-mvp
+app_file: app.py
+sdk: gradio
+sdk_version: 5.22.0
+---
 # 基于小样本的叙事风格迁移研究（MVP）
 
 本项目实现一个可复现实验流水线：
@@ -155,8 +161,7 @@ python scripts/export_case_summary_md.py
 
 其中 `metrics.details` 当前包含：
 - `semantic`：语义指标明细
-- `llm_judge`：主裁判明细
-- `llm_judge_by_model`：双裁判逐模型明细
+- `llm_judge`：单裁判明细（DeepSeek-V3.2）
 - `style_vector`：风格向量指标明细
 - `fluency`：流利度原始细节
 
@@ -192,8 +197,8 @@ python scripts/export_case_summary_md.py
 - 作用：以大模型主观判别风格贴合度
 
 主流程中：
-- `llm_judge_score` 为兼容字段（默认取首裁判模型）
-- `details.llm_judge_by_model` 保留双裁判完整明细
+- `llm_judge_score` 为单裁判总分（DeepSeek-V3.2）
+- `details.llm_judge` 保留单裁判维度明细与评语
 
 ### 6.3 Style Embedding Distance（风格向量距离）
 - 做法：

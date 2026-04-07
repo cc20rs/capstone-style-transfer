@@ -27,6 +27,19 @@ class FluencyNLLMetric(BaseMetric):
             self.tokenizer = None
             self.model = None
 
+    def _get_effective_max_length(self) -> int:
+        tokenizer_max = getattr(self.tokenizer, "model_max_length", None)
+        model_max = getattr(getattr(self.model, "config", None), "n_positions", None)
+
+        candidates: List[int] = []
+        for value in (tokenizer_max, model_max):
+            if isinstance(value, int) and value > 0 and value < 1_000_000:
+                candidates.append(value)
+
+        if candidates:
+            return int(min(candidates))
+        return 1024
+
     def evaluate(
         self,
         source_text: str,
@@ -51,9 +64,31 @@ class FluencyNLLMetric(BaseMetric):
                 },
             }
 
-        inputs = self.tokenizer(generated_text, return_tensors="pt")
+        effective_max_length = self._get_effective_max_length()
+        raw_inputs = self.tokenizer(generated_text, return_tensors="pt", verbose=False)
+        raw_token_len = int(raw_inputs["input_ids"].shape[1])
+
+        inputs = self.tokenizer(
+            generated_text,
+            return_tensors="pt",
+            truncation=True,
+            max_length=effective_max_length,
+            verbose=False,
+        )
+        used_token_len = int(inputs["input_ids"].shape[1])
+        was_truncated = raw_token_len > used_token_len
+
         with torch.no_grad():
             outputs = self.model(**inputs, labels=inputs["input_ids"])
             nll = float(outputs.loss.item())
         score = 100.0 / max(nll, 1e-6)
-        return {"score": score, "details": {"nll": nll}}
+        return {
+            "score": score,
+            "details": {
+                "nll": nll,
+                "token_len": used_token_len,
+                "max_length": effective_max_length,
+                "truncated": was_truncated,
+                "raw_token_len": raw_token_len,
+            },
+        }

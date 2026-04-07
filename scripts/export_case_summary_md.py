@@ -24,17 +24,14 @@ def main() -> None:
     if not rows:
         raise RuntimeError("case_summary.jsonl is empty")
 
-    judge_models: List[str] = []
-    first_details = rows[0].get("metrics", {}).get("details", {}).get("llm_judge_by_model", {})
-    if isinstance(first_details, dict):
-        judge_models = list(first_details.keys())
+    judge_model_name = "DeepSeek-V3.2"
 
     records: List[Dict[str, Any]] = []
     for item in rows:
         metrics = item.get("metrics", {})
         linguistic = metrics.get("linguistic_stats", {})
         details = metrics.get("details", {})
-        by_model = details.get("llm_judge_by_model", {})
+        single_judge = details.get("llm_judge", {}) if isinstance(details.get("llm_judge", {}), dict) else {}
 
         rec: Dict[str, Any] = {
             "时间戳(timestamp)": item.get("timestamp", ""),
@@ -61,14 +58,11 @@ def main() -> None:
             "副词密度-generated": linguistic.get("adv_density", {}).get("generated", ""),
         }
 
-        for model_name in judge_models:
-            model_result = by_model.get(model_name, {})
-            model_details = model_result.get("details", {}) if isinstance(model_result, dict) else {}
-            rec[f"{model_name}-词汇"] = model_details.get("lexical", "")
-            rec[f"{model_name}-句法"] = model_details.get("syntax", "")
-            rec[f"{model_name}-情绪"] = model_details.get("emotion", "")
-            rec[f"{model_name}-总分"] = model_details.get("overall", model_result.get("score", "") if isinstance(model_result, dict) else "")
-            rec[f"{model_name}-评语"] = model_details.get("comment", "")
+        rec[f"{judge_model_name}-词汇"] = single_judge.get("lexical", "")
+        rec[f"{judge_model_name}-句法"] = single_judge.get("syntax", "")
+        rec[f"{judge_model_name}-情绪"] = single_judge.get("emotion", "")
+        rec[f"{judge_model_name}-总分"] = single_judge.get("overall", metrics.get("llm_judge_score", ""))
+        rec[f"{judge_model_name}-评语"] = single_judge.get("comment", "")
 
         records.append(rec)
 
@@ -96,15 +90,13 @@ def main() -> None:
     ]
 
     table2_cols = ["样本ID(case_id)", "策略(strategy)", "目标风格(style_name)"]
-    for model_name in judge_models:
-        table2_cols.extend([
-            f"{model_name}-词汇",
-            f"{model_name}-句法",
-            f"{model_name}-情绪",
-            f"{model_name}-总分",
-        ])
-    for model_name in judge_models:
-        table2_cols.append(f"{model_name}-评语")
+    table2_cols.extend([
+        f"{judge_model_name}-词汇",
+        f"{judge_model_name}-句法",
+        f"{judge_model_name}-情绪",
+        f"{judge_model_name}-总分",
+        f"{judge_model_name}-评语",
+    ])
 
     lines: List[str] = [
         "# case_summary 样本对比（中文释义版）",
@@ -124,7 +116,7 @@ def main() -> None:
         "| metrics.style_vector_score | 风格向量相似度，越高越好 |",
         "| metrics.fluency_score | 流利度分（100/NLL），越高越好 |",
         "| metrics.linguistic_stats.* | 语言学迁移特征（source/target/generated） |",
-        "| metrics.details.llm_judge_by_model | 多裁判模型明细（维度分+评语） |",
+        "| metrics.details.llm_judge | 单裁判明细（维度分+评语） |",
         "",
         "## 二、表格一（内容保真 → 风格相似 → 语言流利 + 语言学特征）",
         "",

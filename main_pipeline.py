@@ -41,7 +41,7 @@ class MainPipeline:
         self.style_vector_metric = StyleVectorDistanceMetric(self.config)
         self.linguistic_metric = LinguisticFeatureMetric(self.config, self.project_root)
         self.fluency_metric = FluencyNLLMetric(self.config)
-        self.judge_models = self.config.get("judge_models", [self.config["models"]["judge_model"]])
+        self.judge_model = self.config["models"]["judge_model"]
 
     def _paths(self) -> Dict[str, Path]:
         p = self.config["paths"]
@@ -50,21 +50,45 @@ class MainPipeline:
             "target_styles": self.project_root / p["target_styles"],
             "style_corpus": self.project_root / p["style_corpus"],
             "case_summary": self.project_root / p["case_summary"],
+            "context_eng_style_references": self.project_root / "data" / "raw" / "Context_Eng_style_references.json",
         }
 
-    def _evaluate_judge_models(self, generated_text: str, target_refs_for_eval: List[str]) -> Dict[str, Any]:
-        by_model: Dict[str, Any] = {}
-        for model_name in self.judge_models:
-            judge_config = dict(self.config)
-            judge_config["models"] = dict(self.config["models"])
-            judge_config["models"]["judge_model"] = model_name
-            judge_metric = LLMStyleJudgeMetric(judge_config, self.api_client)
-            result = judge_metric.evaluate("", generated_text, target_refs_for_eval)
-            by_model[model_name] = {
-                "score": result.get("score", 0.0),
-                "details": result.get("details", {}),
-            }
-        return by_model
+    @staticmethod
+    def _normalize_text_list(value: Any) -> List[str]:
+        if isinstance(value, list):
+            return [item.strip() for item in value if isinstance(item, str) and item.strip()]
+        if isinstance(value, str):
+            return [value.strip()] if value.strip() else []
+        if isinstance(value, dict):
+            merged: List[str] = []
+            for nested in value.values():
+                if isinstance(nested, list):
+                    merged.extend([item.strip() for item in nested if isinstance(item, str) and item.strip()])
+                elif isinstance(nested, str) and nested.strip():
+                    merged.append(nested.strip())
+            return merged
+        return []
+
+    def _get_context_references(self, context_refs_data: Dict[str, Any], style_name: str, scenario: str) -> List[str]:
+        style_block = context_refs_data.get(style_name, {})
+        if not isinstance(style_block, dict):
+            return []
+        if scenario:
+            refs = self._normalize_text_list(style_block.get(scenario, []))
+            return refs[:3]
+        refs = self._normalize_text_list(style_block)
+        return refs[:3]
+
+    def _evaluate_single_judge(self, generated_text: str, target_refs_for_eval: List[str]) -> Dict[str, Any]:
+        judge_config = dict(self.config)
+        judge_config["models"] = dict(self.config["models"])
+        judge_config["models"]["judge_model"] = self.judge_model
+        judge_metric = LLMStyleJudgeMetric(judge_config, self.api_client)
+        result = judge_metric.evaluate("", generated_text, target_refs_for_eval)
+        return {
+            "score": result.get("score", 0.0),
+            "details": result.get("details", {}),
+        }
 
     def _build_metrics(
         self,
@@ -72,20 +96,18 @@ class MainPipeline:
         generated_text: str,
         style_name: str,
         style_references: List[str],
-        target_refs_for_eval: List[str],
+        eval_references: List[str],
     ) -> Dict[str, Any]:
         semantic = self.semantic_metric.evaluate(source_text, generated_text, style_references)
-        judge_by_model = self._evaluate_judge_models(generated_text, target_refs_for_eval)
-        primary_judge_model = self.judge_models[0]
-        primary_judge = judge_by_model.get(primary_judge_model, {"score": 0.0, "details": {}})
-        style_vector = self.style_vector_metric.evaluate(source_text, generated_text, target_refs_for_eval)
+        primary_judge = self._evaluate_single_judge(generated_text, eval_references)
+        style_vector = self.style_vector_metric.evaluate(source_text, generated_text, eval_references)
         linguistic = self.linguistic_metric.evaluate(
             source_text,
             generated_text,
-            style_references,
+            eval_references,
             target_style_name=style_name,
         )
-        fluency = self.fluency_metric.evaluate(source_text, generated_text, style_references)
+        fluency = self.fluency_metric.evaluate(source_text, generated_text, eval_references)
 
         return {
             "bert_score": semantic["score"],
@@ -96,7 +118,6 @@ class MainPipeline:
             "details": {
                 "semantic": semantic["details"],
                 "llm_judge": primary_judge["details"],
-                "llm_judge_by_model": judge_by_model,
                 "style_vector": style_vector["details"],
                 "fluency": fluency["details"],
             },
@@ -107,6 +128,7 @@ class MainPipeline:
         test_cases = load_json(paths["raw_cases"]).get("cases", [])
         target_styles = load_json(paths["target_styles"])
         style_corpus = load_json(paths["style_corpus"])
+        context_eng_style_references = load_json(paths["context_eng_style_references"])
 
         strategies = [
             ("Baseline_A_Prompt_Eng", self.prompt_generator),
@@ -118,14 +140,16 @@ class MainPipeline:
             case_id = case["case_id"]
             source_text = case["source_text"]
             style_name = case["style_name"]
+            scenario = str(case.get("scenario", "")).strip()
             static_refs = target_styles.get(style_name, [])[:3]
             rag_corpus = style_corpus.get(style_name, [])
+            context_refs = self._get_context_references(context_eng_style_references, style_name, scenario)
 
             for strategy_name, generator in strategies:
                 if strategy_name == "Baseline_A_Prompt_Eng":
                     refs_for_generation: List[str] = []
                 elif strategy_name == "Baseline_B_Context_Eng":
-                    refs_for_generation = static_refs
+                    refs_for_generation = context_refs
                 else:
                     refs_for_generation = rag_corpus
 
@@ -140,13 +164,17 @@ class MainPipeline:
                 else:
                     refs_logged = refs_for_generation
 
-                target_refs_for_eval = refs_logged if refs_logged else static_refs
+                if strategy_name == "Baseline_A_Prompt_Eng":
+                    eval_refs: List[str] = []
+                else:
+                    eval_refs = refs_logged
+
                 metrics = self._build_metrics(
                     source_text=source_text,
                     generated_text=generated["generated_text"],
                     style_name=style_name,
                     style_references=refs_logged,
-                    target_refs_for_eval=target_refs_for_eval,
+                    eval_references=eval_refs,
                 )
 
                 row = {

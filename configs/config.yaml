@@ -14,7 +14,6 @@ huggingface:
 
 judge_models:
   - DeepSeek-V3.2
-  - Qwen3-Next-80B-A3B-Instruct
 
 modelscope:
   enabled: true
