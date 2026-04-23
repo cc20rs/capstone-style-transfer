@@ -12,7 +12,6 @@ from dotenv import load_dotenv
 from src.evaluator.fluency_nll import FluencyNLLMetric
 from src.evaluator.linguistic import LinguisticFeatureMetric
 from src.evaluator.semantic import SemanticBERTScoreMetric
-from src.evaluator.style_llm import LLMStyleJudgeMetric
 from src.evaluator.style_vector import StyleVectorDistanceMetric
 from src.generator.context_eng import ContextEngineeringGenerator
 from src.generator.prompt_eng import PromptEngineeringGenerator
@@ -38,7 +37,7 @@ class MainPipeline:
         self.rag_generator = RAGICLGenerator(self.config, self.api_client)
 
         self.semantic_metric = SemanticBERTScoreMetric(self.config)
-        self.style_vector_metric = StyleVectorDistanceMetric(self.config)
+        self.style_vector_metric = StyleVectorDistanceMetric(self.config, self.api_client)
         self.linguistic_metric = LinguisticFeatureMetric(self.config, self.project_root)
         self.fluency_metric = FluencyNLLMetric(self.config)
         self.judge_model = self.config["models"]["judge_model"]
@@ -79,17 +78,6 @@ class MainPipeline:
         refs = self._normalize_text_list(style_block)
         return refs[:3]
 
-    def _evaluate_single_judge(self, generated_text: str, target_refs_for_eval: List[str]) -> Dict[str, Any]:
-        judge_config = dict(self.config)
-        judge_config["models"] = dict(self.config["models"])
-        judge_config["models"]["judge_model"] = self.judge_model
-        judge_metric = LLMStyleJudgeMetric(judge_config, self.api_client)
-        result = judge_metric.evaluate("", generated_text, target_refs_for_eval)
-        return {
-            "score": result.get("score", 0.0),
-            "details": result.get("details", {}),
-        }
-
     def _build_metrics(
         self,
         source_text: str,
@@ -99,8 +87,9 @@ class MainPipeline:
         eval_references: List[str],
     ) -> Dict[str, Any]:
         semantic = self.semantic_metric.evaluate(source_text, generated_text, style_references)
-        primary_judge = self._evaluate_single_judge(generated_text, eval_references)
         style_vector = self.style_vector_metric.evaluate(source_text, generated_text, eval_references)
+        style_label = str(style_vector.get("details", {}).get("label", ""))
+        style_comment = str(style_vector.get("details", {}).get("comment", ""))
         linguistic = self.linguistic_metric.evaluate(
             source_text,
             generated_text,
@@ -111,13 +100,12 @@ class MainPipeline:
 
         return {
             "bert_score": semantic["score"],
-            "llm_judge_score": primary_judge["score"],
-            "style_vector_score": style_vector["score"],
+            "style_label": style_label,
+            "style_comment": style_comment,
             "linguistic_stats": linguistic["details"],
             "fluency_score": fluency["score"],
             "details": {
                 "semantic": semantic["details"],
-                "llm_judge": primary_judge["details"],
                 "style_vector": style_vector["details"],
                 "fluency": fluency["details"],
             },
@@ -153,11 +141,21 @@ class MainPipeline:
                 else:
                     refs_for_generation = rag_corpus
 
-                generated = generator.generate(
-                    source_text=source_text,
-                    target_style_name=style_name,
-                    style_references=refs_for_generation,
-                )
+                if strategy_name == "Baseline_C_RAG_ICL":
+                    generated = generator.generate(
+                        source_text=source_text,
+                        target_style_name=style_name,
+                        style_references=refs_for_generation,
+                        stage=case.get("stage"),
+                        location=case.get("location"),
+                        event=case.get("event"),
+                    )
+                else:
+                    generated = generator.generate(
+                        source_text=source_text,
+                        target_style_name=style_name,
+                        style_references=refs_for_generation,
+                    )
 
                 if strategy_name == "Baseline_C_RAG_ICL":
                     refs_logged = generated["style_references"]

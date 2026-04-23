@@ -30,7 +30,7 @@ def read_jsonl(file_path: Path) -> List[Dict[str, Any]]:
     if not file_path.exists():
         return []
     rows: List[Dict[str, Any]] = []
-    with file_path.open("r", encoding="utf-8") as file:
+    with file_path.open("r", encoding="utf-8-sig") as file:
         for line in file:
             line = line.strip()
             if not line:

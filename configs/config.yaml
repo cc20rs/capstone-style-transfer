@@ -5,7 +5,7 @@ project:
 models:
   generation_model: DeepSeek-V3.2-Instruct
   judge_model: DeepSeek-V3.2
-  style_embedding_model: sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
+  style_embedding_model: BAAI/bge-m3
   fluency_model: uer/gpt2-chinese-cluecorpussmall
   bert_score_model: bert-base-chinese
 
@@ -19,7 +19,7 @@ modelscope:
   enabled: true
   cache_dir: .modelscope_cache
   local_models:
-    style_embedding_model: .modelscope_cache/sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
+    style_embedding_model: .modelscope_cache/BAAI/bge-m3
     fluency_model: .modelscope_cache/uer/gpt2-chinese-cluecorpussmall
     bert_score_model: .modelscope_cache/google-bert/bert-base-chinese
 
@@ -48,13 +48,14 @@ paths:
 evaluation:
   methods:
     semantic: BERTScore-F1
-    style_vector: sentence-transformers-cosine
+    llm_judge: merged-into-style_vector
+    style_vector: llm-as-a-judge-4level
     fluency: 100_over_NLL
     linguistic: jieba_pos_stats
     allow_fallback: false
   weights:
     bert_score: 0.30
-    llm_judge: 0.25
-    style_vector: 0.20
+    llm_judge: 0.00
+    style_vector: 0.45
     linguistic: 0.15
     fluency: 0.10

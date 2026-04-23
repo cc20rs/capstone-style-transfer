@@ -216,8 +216,9 @@ class RealMainPipelineAdapter:
             eval_refs = refs_for_generation
 
         semantic = pipeline.semantic_metric.evaluate(source_text, generated_text, refs_for_generation)
-        primary_judge = pipeline._evaluate_single_judge(generated_text, eval_refs)
         style_vector = pipeline.style_vector_metric.evaluate(source_text, generated_text, eval_refs)
+        style_label = str(style_vector.get("details", {}).get("label", ""))
+        style_comment = str(style_vector.get("details", {}).get("comment", ""))
         linguistic = pipeline.linguistic_metric.evaluate(
             source_text,
             generated_text,
@@ -229,13 +230,12 @@ class RealMainPipelineAdapter:
 
         metrics = {
             "bert_score": float(semantic.get("score", 0.0)),
-            "llm_judge_score": float(primary_judge.get("score", 0.0)),
-            "style_vector_score": float(style_vector.get("score", 0.0)),
+            "style_label": style_label,
+            "style_comment": style_comment,
             "linguistic_stats": linguistic.get("details", {}),
             "fluency_score": float(fluency.get("score", 0.0)),
             "details": {
                 "semantic": semantic.get("details", {}),
-                "llm_judge": primary_judge.get("details", {}),
                 "style_vector": style_vector.get("details", {}),
                 "fluency": fluency.get("details", {}),
             },
@@ -301,7 +301,6 @@ class ExperimentRecordStore:
         )
 
         bert_score = float(metrics.get("bert_score", 0.0))
-        style_vector_score = float(metrics.get("style_vector_score", 0.0))
         fluency_score = float(metrics.get("fluency_score", 0.0))
 
         record = {
@@ -316,9 +315,9 @@ class ExperimentRecordStore:
             "style_references": style_references,
             "generated_text": generated_text,
             "bert_score": bert_score,
-            "style_vector_score": style_vector_score,
             "fluency_score": fluency_score,
-            "llm_judge_score": float(metrics.get("llm_judge_score", 0.0)),
+            "style_label": str(metrics.get("style_label", "")),
+            "style_comment": str(metrics.get("style_comment", "")),
             "linguistic_stats": metrics.get("linguistic_stats", {}),
             "details": metrics.get("details", {}),
             "metrics": metrics,

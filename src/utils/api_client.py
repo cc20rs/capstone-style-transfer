@@ -23,6 +23,7 @@ class APIClient:
         self,
         model: str,
         prompt: str,
+        system_prompt: Optional[str] = None,
         temperature: float = 0.7,
         max_tokens: int = 1024,
         extra_payload: Optional[Dict[str, Any]] = None,
@@ -34,9 +35,13 @@ class APIClient:
         last_error: Optional[Exception] = None
         for attempt in range(1, self.max_retries + 1):
             try:
+                messages = []
+                if system_prompt and system_prompt.strip():
+                    messages.append({"role": "system", "content": system_prompt.strip()})
+                messages.append({"role": "user", "content": prompt})
                 response = self.client.chat.completions.create(
                     model=model,
-                    messages=[{"role": "user", "content": prompt}],
+                    messages=messages,
                     temperature=temperature,
                     max_tokens=max_tokens,
                     timeout=self.timeout,

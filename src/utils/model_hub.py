@@ -17,7 +17,10 @@ def _is_local_model_ready(model_key: str, local_path: Path) -> bool:
         return False
 
     if model_key == "style_embedding_model":
-        return (local_path / "modules.json").exists()
+        has_modules = (local_path / "modules.json").exists()
+        has_config = (local_path / "config.json").exists()
+        has_weights = (local_path / "pytorch_model.bin").exists() or (local_path / "model.safetensors").exists()
+        return has_modules and has_config and has_weights
 
     if model_key in {"fluency_model", "bert_score_model"}:
         has_config = (local_path / "config.json").exists()
